@@ -3,10 +3,6 @@ name: Update ADEV Cross Repo Docs
 on:
   workflow_dispatch:
     inputs: {}
-  push:
-    branches:
-      - 'main'
-      - '[0-9]+.[0-9]+.x'
 
 # Declare default permissions as read only.
 permissions:
@@ -17,6 +13,7 @@ jobs:
     name: Update Cross Repo ADEV Docs
     if: github.repository == 'angular/angular'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Prevents multiple concurrent runs of this workflow for the same branch
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}

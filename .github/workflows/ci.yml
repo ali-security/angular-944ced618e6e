@@ -1,10 +1,12 @@
 name: CI (push)
 
 on:
-  push:
-    branches:
-      - main
-      - '[0-9]+.[0-9]+.x'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional Bazel target pattern(s) to run instead of the job default'
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,7 +20,10 @@ defaults:
 
 jobs:
   lint:
+    # Disabled: lint/format/static-analysis gate only, executes no package code.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -38,7 +43,10 @@ jobs:
         run: pnpm check-tooling-setup
 
   devtools:
+    # Disabled: Cypress e2e + RBE; unrelated to @angular/compiler and cannot run without RBE.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -67,22 +75,43 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: compiler
+            targets: //packages/compiler/test/...
+          - name: core
+            targets: //packages/core/test:test //packages/core/test:test_web
+          - name: core-acceptance
+            targets: //packages/core/test/acceptance/...
+          - name: compiler-cli
+            targets: //packages/compiler-cli/test/ngtsc/... //packages/compiler-cli/test/compliance/...
+    name: test (${{ matrix.name }})
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
       - name: Setup Bazel
         uses: angular/dev-infra/github-actions/bazel/setup@ba726e7bca0b08b125ccc6f93c233749e1213c17
-      - name: Setup Bazel Remote Caching
-        uses: angular/dev-infra/github-actions/bazel/configure-remote@ba726e7bca0b08b125ccc6f93c233749e1213c17
-        with:
-          google_credential: ${{ secrets.RBE_TRUSTED_BUILDS_USER }}
       - name: Install node modules
         run: pnpm install --frozen-lockfile
+      # Upstream runs `pnpm test:ci` (all of `//...`) on RBE. The fork has no RBE
+      # credential, so the suite is sharded over the packages whose sources we ship
+      # or depend on, and each shard runs the project's own Bazel test targets.
       - name: Run CI tests for framework
-        run: pnpm test:ci
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            pnpm bazel test -- ${{ inputs.test-filter }}
+          else
+            pnpm bazel test -- ${{ matrix.targets }}
+          fi
 
   integration-tests:
+    # Disabled: `//integration/...` needs a full framework release build; does not fit the CI budget without RBE.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -98,8 +127,11 @@ jobs:
         run: pnpm integration-tests:ci
 
   adev:
+    # Disabled: unrelated to the @angular/compiler package and does not fit the budget without RBE.
+    if: false
     runs-on:
       labels: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -117,8 +149,11 @@ jobs:
         run: pnpm bazel build //adev:build
 
   vscode-ng-language-service:
+    # Disabled: unrelated to the @angular/compiler package and does not fit the budget without RBE.
+    if: false
     runs-on:
       labels: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -133,25 +168,44 @@ jobs:
       - name: Run tests
         run: pnpm bazel test //vscode-ng-language-service/...
 
-  publish-snapshots:
-    runs-on:
-      labels: ubuntu-latest
+  build-npm-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
       - name: Setup Bazel
         uses: angular/dev-infra/github-actions/bazel/setup@ba726e7bca0b08b125ccc6f93c233749e1213c17
-      - name: Setup Bazel RBE
-        uses: angular/dev-infra/github-actions/bazel/configure-remote@ba726e7bca0b08b125ccc6f93c233749e1213c17
       - name: Install node modules
         run: pnpm install --frozen-lockfile
-      - run: echo "https://${{secrets.SNAPSHOT_BUILDS_GITHUB_TOKEN}}:@github.com" > ${HOME}/.git_credentials
-      - run: pnpm build
-      - run: ./scripts/ci/publish-snapshot-build-artifacts.sh
+      # `--config=release` runs the workspace stamping script so the
+      # `0.0.0-PLACEHOLDER` version in packages/compiler/package.json is replaced
+      # with the real release version. Only the @angular/compiler package is built;
+      # `pnpm build` would build every release package and does not fit the budget.
+      - name: Build the @angular/compiler npm package
+        run: pnpm bazel build --config=release //packages/compiler:npm_package
+      # The published tarball was packed with npm 10.9.7; npm's always-include rules
+      # differ across majors, so pack with that exact version.
+      - name: Pack the npm package
+        run: |
+          npm i -g npm@10.9.7
+          mkdir -p dist/release-artifacts
+          npm pack ./dist/bin/packages/compiler/npm_package --pack-destination dist/release-artifacts
+          mv dist/release-artifacts/angular-compiler-*.tgz dist/release-artifacts/compiler-21.2.19.tgz
+          ls -l dist/release-artifacts
+      - name: Upload the npm package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: npm-package
+          path: dist/release-artifacts/compiler-21.2.19.tgz
+          if-no-files-found: error
 
   zone-js:
+    # Disabled: builds and tests the separate zone.js package, incl. Electron.
+    if: false
     runs-on:
       labels: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
@@ -203,9 +257,11 @@ jobs:
   #     - uses: ./.github/actions/saucelabs-legacy
 
   adev-deploy:
+    # Disabled: deploys to Firebase and needs secrets the fork does not have.
+    if: false
     needs: [adev]
-    if: needs.adev.result == 'success'
-    runs-on: ubuntu-latest-8core
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Initialize environment
         uses: angular/dev-infra/github-actions/npm/checkout-and-setup-node@ba726e7bca0b08b125ccc6f93c233749e1213c17
